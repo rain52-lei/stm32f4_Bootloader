@@ -1,0 +1,35 @@
+# ===== Keil MDK 编译产物（都可由源码重新生成，不进仓库） =====
+Objects/
+Listings/
+DebugConfig/
+*.o
+*.d
+*.crf
+*.dep
+*.lnp
+*.lst
+*.htm
+*.iex
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.scvd
+*.bak
+
+# uVision 界面布局（纯个人偏好）
+*.uvguix.*
+
+# JLink 调试日志
+JLinkLog.txt
+*.jlink
+
+# ===== Python =====
+__pycache__/
+*.pyc
+
+# ===== 系统/编辑器 =====
+Thumbs.db
+.vscode/
+.idea/
