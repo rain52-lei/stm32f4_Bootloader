@@ -20,14 +20,12 @@
 #include "main.h"
 #include "usart.h"
 #include "gpio.h"
-
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "boot_jump.h"
 #include "boot_update.h"
 #include "boot_flash.h"
 #include "boot_metadata.h"
-#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -123,9 +121,9 @@ int main(void)
 #endif
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  static const uint8_t wait[] = "WAIT UPDATE (2s)\r\n";
-  static const uint8_t jump[] = "TIMEOUT: JUMPING TO APP\r\n";
-  static const uint8_t invalid[] = "APP INVALID: STAY IN BOOTLOADER\r\n";
+    static const uint8_t wait[] = "WAIT UPDATE (2s)\r\n";
+    static const uint8_t jump[] = "TIMEOUT: JUMPING TO APP\r\n";
+    static const uint8_t invalid[] = "APP INVALID: STAY IN BOOTLOADER\r\n";
 	static const uint8_t header_bad[] = "HEADER BAD\r\n";
 	static const uint8_t header_timeout[] = "HEADER TIMEOUT\r\n";
 	static const uint8_t erase_ok[] = "ERASE OK\r\n";

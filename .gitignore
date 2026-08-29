@@ -25,6 +25,11 @@ DebugConfig/
 JLinkLog.txt
 *.jlink
 
+# Keil Assistant 运行日志（.vscode 里的 c_cpp_properties.json 保留提交）
+uv4*.log
+uv4.log.lock
+keil-assistant.log
+
 # ===== Python =====
 __pycache__/
 *.pyc
