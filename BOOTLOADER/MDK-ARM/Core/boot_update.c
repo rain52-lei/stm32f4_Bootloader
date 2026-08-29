@@ -15,14 +15,49 @@ int boot_receive_header(firmware_header_t *header)
 	return 0;
 }
 
-/* 接收包头 
+/* 接收包头
+    先扫描同步字 AA 55 重获边界 锁定后在接受包
     每一包都接收12字节分包头 */
 int boot_receive_chunk_header(firmware_chunk_header_t *header)
 {
+	uint8_t byte;
+	uint32_t sync_stage = 0U;
+	uint32_t start_tick = HAL_GetTick();
+	uint8_t locked = 0U;
+	
 	if(header == NULL)
 	{
 		return 0;
 	}
+	
+	while((HAL_GetTick() - start_tick) < SYNC_SCAN_TIMEOUT_MS)
+	{
+		if(HAL_UART_Receive(&huart1, &byte, 1U, 10U) != HAL_OK)
+		{
+			continue;
+		}
+		if(sync_stage == 0U)
+		{
+			if(byte == CHUNK_SYNC0)
+				sync_stage = 1U;
+		}
+		else if(byte == CHUNK_SYNC1)
+		{
+			locked = 1U;
+			break;
+		}
+		else
+		{
+			sync_stage = (byte == CHUNK_SYNC0 ? 1U : 0U);
+		}
+	}
+	
+	if(!locked)
+	{
+		return 0;
+	}
+	
+	
 	if(HAL_UART_Receive(&huart1,(uint8_t *)header,sizeof(*header),1000U) == HAL_OK)
 	{
 		return 1;

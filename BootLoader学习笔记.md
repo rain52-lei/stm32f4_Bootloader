@@ -2252,10 +2252,142 @@ Bootloader 端对应的重试循环：每个包单独把 `retry_count` 清零；
 检查当前代码发现一个协议阻塞点：`boot_flash.c` 会调用 `boot_send_chunk_reply(BOOT_REPLY_READY, ...)`，但 `boot_update.c` 中该函数的合法性判断目前只允许 `BOOT_REPLY_ACK` 和 `BOOT_REPLY_NACK`，因此 READY 会被函数直接拒绝发送，Python 会一直等不到 READY。新增任何回复状态后，发送函数的合法状态白名单必须同步扩展。
 ### 当前代码检查（2026-08-28）
 
-当前 `boot_send_chunk_reply()` 已允许 ACK、NACK、READY 三种状态，和 `boot_receive_and_write()` 及 Python 的两阶段握手一致；`FW_CHUNK_MAX_RETRIES` 也已定义为 3。`boot_flash.c` 顶部仍有旧的 `static const uint8_t ack[] = "OK\\r\\n"`，但新版循环已不再使用，可删除。另一个可靠性注意点是：如果 `HAL_UART_Receive()` 超时后只收到部分数据，残留字节可能让下一次重试的包头错位；当前先完成正常流程测试，之后可通过“清空接收缓冲/帧同步魔数”进一步增强。
+当前 `boot_send_chunk_reply()` 已允许 ACK、NACK、READY 三种状态，和 `boot_receive_and_write()` 及 Python 的两阶段握手一致；`FW_CHUNK_MAX_RETRIES` 也已定义为 3。`boot_flash.c` 顶部仍有旧的 `static const uint8_t ack[] = "OK\\r\\n"`，但新版循环已不再使用（2026-08-29 核对：该变量已删除，本项关闭）。另一个可靠性注意点是：如果 `HAL_UART_Receive()` 超时后只收到部分数据，残留字节可能让下一次重试的包头错位；当前先完成正常流程测试，之后可通过“清空接收缓冲/帧同步魔数”进一步增强。
+## 第 23 课：帧同步——当字节流的边界丢失时
+
+> 状态（2026-08-29）：**已实现并全量验证通过**。过程记录：① 死锁实验——旧上位机发旧格式包头（第 0 包 12 字节里连 AA/55 都没有），Bootloader 每次扫满 5 秒窗口后回 NACK，3 次重试后有序失败，与推演完全一致；② 上位机收编 `send_chunk_header()` 为分包头唯一出口（grep 验证 `<III` 格式全项目仅此一处）；③ `test_crc_fail.py` 属于最老版协议（裸发数据等文本 OK），顺带修成两阶段握手；④ `test_frame_sync.py` 三场景（垃圾前缀 / 假锁定自愈 / 半包超时）+ `flash_send.py`、`test_retry.py` 回归全部通过，WRITE DONE 收尾。
+>
+> 本课踩坑：首版 `boot_receive_chunk_header()` 把出口写反了（`== HAL_OK` 时返回 0），包头明明收到却报失败，协议一包都过不去。教训：**函数的每个 return 出口都要人工走一遍**，且必须先跑 happy path 再加异常注入。
+
+### 23.1 错位事故的字节级推演
+
+现协议有一个隐含假设：每次 `HAL_UART_Receive()` 都恰好消费整数个包。打破它的场景：
+
+1. 上位机发 12 字节分包头，只到 7 字节，接收超时返回——**7 字节已被消费**；
+2. Bootloader 回 NACK，上位机重发完整 12 字节；
+3. Bootloader 再读 12 字节 = 旧包头尾巴 5 字节 + 新包头开头 7 字节 = 一个垃圾包头；
+4. sequence 不匹配 → NACK → 重发 → 偏移仍是 7 字节……
+
+**只要字节流偏移不是 12 的倍数，错位永远无法自愈**，直到 `FW_CHUNK_MAX_RETRIES` 耗尽，整次升级失败。串口线插拔、打开串口时的杂字节、复位中途进入升级，都可能触发。
+
+帧同步的本质：给接收方一个**主动重获边界**的手段，而不是指望字节流自己变干净。
+
+### 23.2 设计决策三问
+
+**Q1：同步字为什么是 AA 55？两个字节能防住假锁定吗？**
+AA = 10101010、55 = 01010101，位特征鲜明，线路噪声凑出该序列的概率低。但两个字节**防不住假锁定**——数据区里完全可能出现 AA 55。真正的防线是组合拳：
+
+> 同步字负责"边界可能在哪"，包头校验负责"边界对不对"。
+
+假锁定后 Bootloader 读 12 字节垃圾，sequence 恰好等于期待值**且** CRC32 恰好自洽的概率约等于零 → 校验拒绝 → 继续扫描。**假锁定无害、可自愈**——这句话是本课的灵魂。
+
+**Q2：扫描状态机怎么写？**
+与 `boot_wait_update_command()` 同款手法（字符流匹配状态机 → 字节流边界恢复，同一思想第二次应用）：状态 0 = 找 AA；状态 1 = AA 已见、找 55。细节：状态 1 时又收到 AA 应**保持状态 1**（`AA AA 55` 也是合法锁定）；收到其他字节回状态 0。
+
+**Q3：扫描窗口多长？**
+NACK 后上位机立即重发，窗口覆盖重传到达时间即可，取 5 秒（兼顾人为操作）。窗口内单字节 10ms 超时轮询，总窗口用 `HAL_GetTick()` 控制——时间结构照抄 `boot_wait_update_command()`。
+
+### 23.3 包格式变化（只动分包头）
+
+```text
+原来： sequence(4) | length(4) | crc32(4) | data...
+现在： AA 55 | sequence(4) | length(4) | crc32(4) | data...
+```
+
+UPDATE 命令与 16 字节固件头**不改**——那条路有 "WAIT UPDATE" 文本锚点，不存在错位问题。
+
+### 23.4 Bootloader 端：替换 `boot_receive_chunk_header()`
+
+```c
+#define CHUNK_SYNC0           0xAAU
+#define CHUNK_SYNC1           0x55U
+#define SYNC_SCAN_TIMEOUT_MS  5000U
+
+/* 先扫描同步字 AA 55 重获边界，锁定后再收 12 字节分包头 */
+int boot_receive_chunk_header(firmware_chunk_header_t *header)
+{
+    uint8_t  byte;
+    uint32_t sync_stage = 0U;          /* 0=找AA, 1=AA已见找55 */
+    uint32_t start_tick = HAL_GetTick();
+    uint8_t  locked = 0U;
+
+    if (header == NULL)
+    {
+        return 0;
+    }
+
+    while ((HAL_GetTick() - start_tick) < SYNC_SCAN_TIMEOUT_MS)
+    {
+        if (HAL_UART_Receive(&huart1, &byte, 1U, 10U) != HAL_OK)
+        {
+            continue;                  /* 窗口内暂时没字节，继续扫 */
+        }
+        if (sync_stage == 0U)
+        {
+            if (byte == CHUNK_SYNC0) sync_stage = 1U;
+        }
+        else if (byte == CHUNK_SYNC1)
+        {
+            locked = 1U;
+            break;
+        }
+        else
+        {
+            sync_stage = (byte == CHUNK_SYNC0) ? 1U : 0U;
+        }
+    }
+
+    if (!locked)
+    {
+        return 0;                      /* 5 秒没等到同步字，上层 NACK 重试 */
+    }
+    if (HAL_UART_Receive(&huart1, (uint8_t *)header, sizeof(*header), 1000U) != HAL_OK)
+    {
+        return 0;                      /* 锁定后包头没到齐，同样交给 NACK */
+    }
+    return 1;
+}
+```
+
+`boot_chunk_header_is_valid()` **一行不改**：sequence/length/CRC 校验照旧，同步层只负责回答"包头从哪开始"。
+
+### 23.5 上位机端与 DRY 重构
+
+```python
+CHUNK_SYNC = b'\xAA\x55'
+ser.write(CHUNK_SYNC + struct.pack('<III', sequence, len(chunk), chunk_crc))
+```
+
+协议格式目前散落在 `flash_send.py` 与 4 个 `test_*.py` 各自手写的 `struct.pack('<III', ...)` 里——本次改动必须全改，正好暴露了这个坏味道。重构：`flash_send.py` 新增统一出口：
+
+```python
+CHUNK_SYNC = b'\xAA\x55'
+
+def send_chunk_header(ser, sequence, length, crc32_val):
+    """分包头唯一出口：同步字 + 12 字节。所有脚本统一调用。"""
+    ser.write(CHUNK_SYNC + struct.pack('<III', sequence, length, crc32_val))
+```
+
+测试脚本全部改为 import 它。**协议格式永远只写一处**——这个习惯适用于以后任何协议开发。
+
+### 23.6 验收测试（新建 test_frame_sync.py）
+
+1. **垃圾前缀**：发 30 个随机字节 + 同步字 + 包头 → 应正常 READY → ACK；
+2. **假锁定自愈**：发真实固件数据（天然可能含 AA 55），制造一次 NACK，重发完整包 → 应恢复成功；
+3. **半包超时**：包头 → READY → 只发 50/256 字节 → 等 NACK → 重发 → 成功，且整次升级最终走到 WRITE DONE。
+
+### 23.7 本课必须记住
+
+- 同步字解决"边界在哪"，包头校验解决"边界对不对"——**缺一不可**；
+- 假锁定无害的前提是包头有强校验（sequence 匹配 + CRC32 自洽）；
+- 字节流协议永远不要假设"上一次读取消费干净了"——串口、网络协议的通则；
+- 协议格式（同步字、包头布局）在代码里只允许出现一处。
+
+---
+
 ## 后续学习目标：帧同步与可靠升级扩展
 
-下一阶段首先实现**帧同步与错位恢复**。问题是 UART 可能只收到半个包就超时，遗留字节会使下一次重传时的分包头错位。解决方案是在每个分包前增加固定同步字（建议两个字节 `0xAA 0x55`）：
+下一阶段首先实现**帧同步与错位恢复**（课程内容见第 23 课，代码待实现）。问题是 UART 可能只收到半个包就超时，遗留字节会使下一次重传时的分包头错位。解决方案是在每个分包前增加固定同步字（建议两个字节 `0xAA 0x55`）：
 
 ```text
 AA 55 + sequence + length + chunk_crc32 + data

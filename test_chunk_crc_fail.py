@@ -10,7 +10,8 @@ import zlib
 
 import serial
 
-from flash_send import BAUD, CHUNK, DEFAULT_BIN, FW_MAGIC, FW_VERSION, PORT, wait_for
+from flash_send import (BAUD, CHUNK, DEFAULT_BIN, FW_MAGIC, FW_VERSION, PORT,
+                        send_chunk_header, wait_for)
 
 
 def main():
@@ -50,7 +51,7 @@ def main():
         return
 
     # 第 0 包：序号、长度正确，但包 CRC 故意错误。
-    ser.write(struct.pack("<III", 0, len(chunk), bad_chunk_crc))
+    send_chunk_header(ser, 0, len(chunk), bad_chunk_crc)
     ser.write(chunk)
     print(">>> 已发送第 0 包：数据正确，但包 CRC 故意错误。")
 

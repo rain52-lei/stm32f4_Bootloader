@@ -16,6 +16,10 @@
 #define BOOT_REPLY_NACK   0x15U
 #define BOOT_REPLY_READY  0x16U
 
+#define CHUNK_SYNC0           0xAAU
+#define CHUNK_SYNC1           0x55U
+#define SYNC_SCAN_TIMEOUT_MS  5000U
+
 /*
  * 串口升级时最先传输的 16 字节。
  * 四个成员都是 uint32_t，因此此结构体的大小为 16 字节。

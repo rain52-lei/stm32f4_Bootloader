@@ -10,7 +10,8 @@ import zlib
 
 import serial
 
-from flash_send import BAUD, CHUNK, DEFAULT_BIN, FW_MAGIC, FW_VERSION, PORT, wait_for
+from flash_send import (BAUD, CHUNK, DEFAULT_BIN, FW_MAGIC, FW_VERSION, PORT,
+                        send_chunk_header, wait_for)
 
 
 def main():
@@ -49,7 +50,7 @@ def main():
         return
 
     # 数据、长度、CRC 均正确，只有 sequence 从 0 故意改成 1。
-    ser.write(struct.pack("<III", 1, len(chunk), chunk_crc))
+    send_chunk_header(ser, 1, len(chunk), chunk_crc)
     ser.write(chunk)
     print(">>> 已发送第一个包，但 sequence=1（应为 0）。")
 

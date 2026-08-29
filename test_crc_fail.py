@@ -11,7 +11,9 @@ import zlib
 
 import serial
 
-from flash_send import BAUD, CHUNK, DEFAULT_BIN, FW_MAGIC, FW_VERSION, PORT, wait_for
+from flash_send import (BAUD, BOOT_REPLY_ACK, BOOT_REPLY_READY, CHUNK,
+                        DEFAULT_BIN, FW_MAGIC, FW_VERSION, PORT,
+                        read_chunk_reply, send_chunk_header, wait_for)
 
 
 def main():
@@ -47,14 +49,22 @@ def main():
         return
 
     sent = 0
+    sequence = 0
     while sent < size:
         chunk = fw[sent:sent + CHUNK]
+        send_chunk_header(ser, sequence, len(chunk),
+                          zlib.crc32(chunk) & 0xFFFFFFFF)
+        if not read_chunk_reply(ser, BOOT_REPLY_READY, sequence):
+            print("!! 第 %d 包未收到 READY" % sequence)
+            ser.close()
+            return
         ser.write(chunk)
-        if not wait_for(ser, "OK"):
-            print("!! 第 %d 字节没有收到 ACK" % sent)
+        if not read_chunk_reply(ser, BOOT_REPLY_ACK, sequence):
+            print("!! 第 %d 包未收到 ACK" % sequence)
             ser.close()
             return
         sent += len(chunk)
+        sequence += 1
         print("\r进度: %d / %d" % (sent, size), end="")
     print()
 

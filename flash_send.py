@@ -32,6 +32,7 @@ MAX_RETRIES = 3
 BOOT_REPLY_ACK = 0x06
 BOOT_REPLY_NACK = 0x15
 BOOT_REPLY_READY = 0x16
+CHUNK_SYNC = b'\xAA\x55'      # 分包头同步字，与 Bootloader 端 CHUNK_SYNC0/1 约定一致
 
 
 def wait_for(ser, marker, timeout=5.0):
@@ -97,6 +98,11 @@ def read_chunk_reply(ser, expected_status, expected_sequence, timeout=5.0):
         return status == expected_status and sequence == expected_sequence
 
     return False
+
+
+def send_chunk_header(ser, sequence, length, crc32_val):
+    """分包头唯一出口：同步字 AA 55 + 12 字节小端包头（序号、长度、本包 CRC32）。"""
+    ser.write(CHUNK_SYNC + struct.pack('<III', sequence, length, crc32_val))
 
 
 def main():
@@ -168,8 +174,7 @@ def main():
 
         success = False
         for attempt in range(1, MAX_RETRIES + 1):
-            # 每包：序号、数据长度、本包 CRC32，全部为小端 uint32_t。
-            ser.write(struct.pack('<III', sequence, len(chunk), chunk_crc))
+            send_chunk_header(ser, sequence, len(chunk), chunk_crc)
 
             if not read_chunk_reply(ser, BOOT_REPLY_READY, sequence):
                 print('\n!! 第 %d 包未收到 READY（第 %d/%d 次）' %

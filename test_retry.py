@@ -23,15 +23,15 @@ import serial
 
 from flash_send import (BAUD, BOOT_REPLY_ACK, BOOT_REPLY_NACK,
                         BOOT_REPLY_READY, CHUNK, DEFAULT_BIN, FW_MAGIC,
-                        FW_VERSION, PORT, read_chunk_reply, wait_for,
-                        wait_for_any)
+                        FW_VERSION, PORT, read_chunk_reply, send_chunk_header,
+                        wait_for, wait_for_any)
 
 
 def send_packet(ser, sequence, chunk):
     """两阶段握手发送一个包：包头 → READY → 数据 → ACK。成功返回 True。"""
     chunk_crc = zlib.crc32(chunk) & 0xFFFFFFFF
 
-    ser.write(struct.pack('<III', sequence, len(chunk), chunk_crc))
+    send_chunk_header(ser, sequence, len(chunk), chunk_crc)
     if not read_chunk_reply(ser, BOOT_REPLY_READY, sequence):
         print('\n!! 第 %d 包未收到 READY' % sequence)
         return False
@@ -81,7 +81,7 @@ def main():
     good_crc = zlib.crc32(first) & 0xFFFFFFFF
 
     print('--- 第 0 包第 1 次发送：声明的 CRC 故意翻转最低位 ---')
-    ser.write(struct.pack('<III', 0, len(first), good_crc ^ 1))
+    send_chunk_header(ser, 0, len(first), good_crc ^ 1)
     if not read_chunk_reply(ser, BOOT_REPLY_READY, 0):
         print('!! 未收到 READY(0)——分包头阶段就被拒了？')
         ser.close()
