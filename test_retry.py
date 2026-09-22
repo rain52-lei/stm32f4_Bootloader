@@ -22,9 +22,10 @@ import zlib
 import serial
 
 from flash_send import (BAUD, BOOT_REPLY_ACK, BOOT_REPLY_NACK,
-                        BOOT_REPLY_READY, CHUNK, DEFAULT_BIN, FW_MAGIC,
-                        FW_VERSION, PORT, read_chunk_reply, send_chunk_header,
-                        wait_for, wait_for_any)
+                        BOOT_REPLY_READY, CHUNK, DEFAULT_BIN_A, DEFAULT_BIN_B,
+                        FW_VERSION, PORT, SLOT_A, read_chunk_reply,
+                        send_chunk_header, send_firmware_header, wait_for,
+                        wait_for_any, wait_for_boot_banner)
 
 
 def send_packet(ser, sequence, chunk):
@@ -41,17 +42,7 @@ def send_packet(ser, sequence, chunk):
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BIN
     version = int(sys.argv[2]) if len(sys.argv) > 2 else FW_VERSION
-
-    with open(path, 'rb') as f:
-        fw = f.read()
-    size = len(fw)
-    crc = zlib.crc32(fw) & 0xFFFFFFFF
-
-    print('固件   :', path)
-    print('大小   : %d 字节' % size)
-    print('版本   : %d' % version)
 
     ser = serial.Serial(port=None, baudrate=BAUD, timeout=2)
     ser.dtr = False                     # 探索者板必须关，否则 MCU 被按在复位里
@@ -61,13 +52,26 @@ def main():
     ser.reset_input_buffer()
 
     print('>>> 请按一下板上复位键...')
-    if not wait_for(ser, 'WAIT UPDATE'):
-        print('!! 没等到 Bootloader 提示，检查 PORT / 波特率 / DTR-RTS')
+    download_slot = wait_for_boot_banner(ser)
+    if download_slot is None:
+        print('!! 没等到带 DOWNLOAD 槽位的 Bootloader 提示，检查 PORT / 波特率 / DTR-RTS')
         ser.close()
         return
+    path = sys.argv[1] if len(sys.argv) > 1 else (
+        DEFAULT_BIN_A if download_slot == SLOT_A else DEFAULT_BIN_B)
+
+    with open(path, 'rb') as f:
+        fw = f.read()
+    size = len(fw)
+    crc = zlib.crc32(fw) & 0xFFFFFFFF
+
+    print('固件   : %s（槽 %s，跟随 DOWNLOAD）' %
+          (path, 'A' if download_slot == SLOT_A else 'B'))
+    print('大小   : %d 字节' % size)
+    print('版本   : %d' % version)
 
     ser.write(b'UPDATE')
-    ser.write(struct.pack('<IIII', FW_MAGIC, size, crc, version))
+    send_firmware_header(ser, size, crc, version, download_slot)
     reply = wait_for_any(ser,
                          ['ERASE OK', 'VERSION FAIL', 'HEADER BAD',
                           'METADATA FAIL', 'ERASE FAIL'],
