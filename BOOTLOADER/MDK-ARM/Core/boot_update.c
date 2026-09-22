@@ -81,17 +81,21 @@ int boot_chunk_header_is_valid(const firmware_chunk_header_t *header,uint32_t ex
 
 /*  1. header->magic 是否等于 FW_MAGIC
     2. header->size 是否在合法范围内 */
-int boot_header_is_valid(const firmware_header_t *header)
+int boot_header_is_valid(const firmware_header_t *header)                  
 {
-	if(header == NULL)
-	{
-		return 0;
-	}
-	if(header->magic == FW_MAGIC && header->size <= APP_MAX_SIZE && header->size != 0 && header->version != 0)
-	{
-		return 1;
-	}
-	return 0;
+    if (header == NULL)
+    {
+        return 0;
+    }
+    if (header->magic == FW_MAGIC &&
+        header->size != 0U &&
+        header->size <= APP_MAX_SIZE &&
+        header->version != 0U )
+        //header->image_slot == download_slot)
+    {
+        return 1;
+    }
+    return 0;
 }
 
 /* 输入：RAM 缓冲区地址 + 长度
