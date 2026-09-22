@@ -38,3 +38,28 @@ __pycache__/
 Thumbs.db
 .vscode/
 .idea/
+
+# WorkBuddy 项目记忆与本地迁移/配置备份
+.workbuddy-ai/
+*.pre-ab
+
+# App A/B 构建输出（由 Keil 目标重新生成）
+APP/BOOTLoader/MDK-ARM/APP_A/
+APP/BOOTLoader/MDK-ARM/APP_B/
+
+# PlatformIO 构建产物（esp32s3_bridge）
+.pio/
+
+# ===== 本地私有文档：退出版本控制，git add . 也不会再带上 =====
+BootLoader学习笔记.md
+Git使用笔记.md
+VSCode与Keil工具链笔记.md
+BootLoader功能与架构分析.md
+作品集与简历素材清单.md
+函数笔记.md
+简历项目经历-定稿.md
+README.md
+
+# ===== Keil 生成的临时目录 =====
+BOOTLOADER/MDK-ARM/RTE/_test/
+BOOTLOADER/MDK-ARM/test/

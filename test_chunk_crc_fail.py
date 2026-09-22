@@ -1,67 +1,74 @@
-"""测试单包 CRC32：第 0 包数据正常，但故意发送错误的分包 CRC。
+"""测试单包 CRC：坏包应收到 NACK，同序号重发后应恢复并完成升级。"""
 
-预期：Bootloader 在写入第 0 包前拒绝，串口输出 WRITE FAIL。
-测试后请运行 flash_send.py 正常升级恢复 App。
-"""
-
-import struct
 import sys
 import zlib
 
-import serial
-
-from flash_send import (BAUD, CHUNK, DEFAULT_BIN, FW_MAGIC, FW_VERSION, PORT,
-                        send_chunk_header, wait_for)
+from flash_send import (BOOT_REPLY_ACK, BOOT_REPLY_NACK, BOOT_REPLY_READY,
+                        CHUNK, DEFAULT_BIN_A, DEFAULT_BIN_B, FW_VERSION,
+                        SLOT_A, open_serial, read_chunk_reply,
+                        send_chunk_header, send_firmware_header, send_packet,
+                        wait_for, wait_for_any, wait_for_boot_banner)
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BIN
-    with open(path, "rb") as f:
-        fw = f.read()
+    version = int(sys.argv[2]) if len(sys.argv) > 2 else FW_VERSION
 
-    size = len(fw)
-    crc = zlib.crc32(fw) & 0xFFFFFFFF
-    chunk = fw[:CHUNK]
-    real_chunk_crc = zlib.crc32(chunk) & 0xFFFFFFFF
-    bad_chunk_crc = real_chunk_crc ^ 0x00000001
+    ser = open_serial()
+    try:
+        print('>>> 请按一下板上复位键...')
+        download_slot = wait_for_boot_banner(ser)
+        if download_slot is None:
+            print('!! 未解析到 DOWNLOAD 槽')
+            return
+        path = sys.argv[1] if len(sys.argv) > 1 else (
+            DEFAULT_BIN_A if download_slot == SLOT_A else DEFAULT_BIN_B)
+        with open(path, 'rb') as file:
+            fw = file.read()
 
-    print("固件大小 : %d 字节" % size)
-    print("版本     : %d" % FW_VERSION)
-    print("第 0 包真实 CRC: %08X" % real_chunk_crc)
-    print("第 0 包错误 CRC: %08X" % bad_chunk_crc)
+        size = len(fw)
+        crc = zlib.crc32(fw) & 0xFFFFFFFF
+        first = fw[:CHUNK]
+        bad_chunk_crc = (zlib.crc32(first) & 0xFFFFFFFF) ^ 1
+        print('固件: %s（槽 %s，跟随 DOWNLOAD）' %
+              (path, 'A' if download_slot == SLOT_A else 'B'))
 
-    ser = serial.Serial(port=None, baudrate=BAUD, timeout=2)
-    ser.dtr = False
-    ser.rts = False
-    ser.port = PORT
-    ser.open()
-    ser.reset_input_buffer()
+        ser.write(b'UPDATE')
+        send_firmware_header(ser, size, crc, version, download_slot)
+        if wait_for_any(ser, ['ERASE OK', 'VERSION FAIL', 'SLOT MISMATCH'], 10) != 'ERASE OK':
+            print('!! 未进入写入阶段')
+            return
 
-    print(">>> 请按一下板上复位键...")
-    if not wait_for(ser, "WAIT UPDATE", timeout=15):
-        print("!! 没等到 Bootloader 提示")
+        send_chunk_header(ser, 0, len(first), bad_chunk_crc)
+        if not read_chunk_reply(ser, BOOT_REPLY_READY, 0):
+            print('!! 错误 CRC 的包头未收到 READY(0)')
+            return
+        ser.write(first)
+        if not read_chunk_reply(ser, BOOT_REPLY_NACK, 0):
+            print('!! 坏包未收到 NACK(0)')
+            return
+        print('=== 坏包在写 Flash 前被 NACK 拦截 ===')
+
+        if not send_packet(ser, 0, first):
+            print('!! 第 0 包重发失败')
+            return
+
+        sent = len(first)
+        sequence = 1
+        while sent < size:
+            chunk = fw[sent:sent + CHUNK]
+            if not send_packet(ser, sequence, chunk):
+                print('!! 第 %d 包失败' % sequence)
+                return
+            sent += len(chunk)
+            sequence += 1
+
+        if wait_for(ser, 'WRITE DONE', 8):
+            print('=== 测试通过：NACK → 同序号重发 → 完整升级成功 ===')
+        else:
+            print('!! 未等到 WRITE DONE')
+    finally:
         ser.close()
-        return
-
-    ser.write(b"UPDATE")
-    ser.write(struct.pack("<IIII", FW_MAGIC, size, crc, FW_VERSION))
-    if not wait_for(ser, "ERASE OK", timeout=10):
-        print("!! 没等到 ERASE OK")
-        ser.close()
-        return
-
-    # 第 0 包：序号、长度正确，但包 CRC 故意错误。
-    send_chunk_header(ser, 0, len(chunk), bad_chunk_crc)
-    ser.write(chunk)
-    print(">>> 已发送第 0 包：数据正确，但包 CRC 故意错误。")
-
-    if wait_for(ser, "WRITE FAIL", timeout=5):
-        print("=== 测试通过：错误分包 CRC 已在写 Flash 前被拦截 ===")
-    else:
-        print("!! 未等到 WRITE FAIL，请查看串口输出")
-
-    ser.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

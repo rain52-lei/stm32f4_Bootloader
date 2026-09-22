@@ -32,7 +32,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* 与 bootloader 约定的"进升级模式"留言值（ASCII "OTAD"），写进 RTC->BKP0R */
+#define GOTOBOOT_MAGIC    0x4F544144UL
+/* 槽 B 的链接基址，bootloader 跳转前会把 VTOR 设成它 */
+#define SLOT_B_CODE_BASE  0x080A0000UL
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -54,7 +57,108 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static const uint8_t cmd_goto_boot[] = "GOTOBOOT";
+static uint32_t s_match_pos = 0U;     /* GOTOBOOT 匹配进度 */
+static uint32_t s_last_toggle = 0U;   /* LED 上次翻转的时刻 */
 
+/* 裸寄存器 USART1（115200 8N1，与 bootloader 同配置）：App 的 HAL 配置里
+   没开 UART 模块，直接配寄存器反而最省 */
+static void app_usart1_init(void)
+{
+    GPIO_InitTypeDef gpio;
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_USART1_CLK_ENABLE();
+
+    gpio.Pin       = GPIO_PIN_9 | GPIO_PIN_10;
+    gpio.Mode      = GPIO_MODE_AF_PP;
+    gpio.Pull      = GPIO_NOPULL;
+    gpio.Speed     = GPIO_SPEED_FREQ_HIGH;
+    gpio.Alternate = GPIO_AF7_USART1;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    /* APB2 = 84MHz：84M / (16 * 45.5625) = 115200，BRR = 45<<4 | 9 */
+    USART1->BRR = 0x2D9U;
+    USART1->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
+}
+
+static void app_uart_write(const uint8_t *data, uint32_t length)
+{
+    uint32_t i;
+
+    for (i = 0U; i < length; i++)
+    {
+        while ((USART1->SR & USART_SR_TXE) == 0U)
+        {
+        }
+        USART1->DR = data[i];
+    }
+    while ((USART1->SR & USART_SR_TC) == 0U)
+    {
+    }
+}
+
+/* 上电只打一次，上位机拿它当"App 已在运行"的同步点；
+   槽号读自 bootloader 跳转前设置的 VTOR */
+static void app_print_ready(void)
+{
+    static const uint8_t ready_a[] = "APP READY (SLOT A)\r\n";
+    static const uint8_t ready_b[] = "APP READY (SLOT B)\r\n";
+
+    if (SCB->VTOR == SLOT_B_CODE_BASE)
+    {
+        app_uart_write(ready_b, sizeof(ready_b) - 1U);
+    }
+    else
+    {
+        app_uart_write(ready_a, sizeof(ready_a) - 1U);
+    }
+}
+
+/* 主循环高频轮询：RXNE 置位到读 DR 只隔几微秒，8 字节连发不会丢。
+   以后要加别的串口命令，在这个状态机里扩展 */
+static int app_poll_goto_boot(void)
+{
+    uint8_t byte;
+
+    if ((USART1->SR & USART_SR_RXNE) == 0U)
+    {
+        return 0;
+    }
+
+    byte = (uint8_t)USART1->DR;
+    if (byte == cmd_goto_boot[s_match_pos])
+    {
+        s_match_pos++;
+        if (s_match_pos == (sizeof(cmd_goto_boot) - 1U))
+        {
+            s_match_pos = 0U;
+            return 1;
+        }
+    }
+    else
+    {
+        s_match_pos = (byte == cmd_goto_boot[0]) ? 1U : 0U;
+    }
+    return 0;
+}
+
+/* 收到完整 GOTOBOOT：写留言 → 通知上位机 → 复位进 bootloader */
+static void app_reboot_into_boot(void)
+{
+    static const uint8_t msg[] = "GOTOBOOT: REBOOT INTO BOOTLOADER\r\n";
+    volatile uint32_t drain;
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();      /* 备份域默认写保护，先解锁 */
+    RTC->BKP0R = GOTOBOOT_MAGIC;
+
+    app_uart_write(msg, sizeof(msg) - 1U);
+    for (drain = 0U; drain < 100000U; drain++)
+    {
+    }
+    NVIC_SystemReset();
+}
 /* USER CODE END 0 */
 
 /**
@@ -87,19 +191,28 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   /* USER CODE BEGIN 2 */
-
+  app_usart1_init();
+  app_print_ready();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    HAL_GPIO_WritePin(GPIOF,GPIO_PIN_9,GPIO_PIN_RESET);
-		HAL_GPIO_WritePin(GPIOF,GPIO_PIN_10,GPIO_PIN_SET);
-		HAL_Delay(500U);
-    HAL_GPIO_WritePin(GPIOF,GPIO_PIN_9,GPIO_PIN_SET);
-		HAL_GPIO_WritePin(GPIOF,GPIO_PIN_10,GPIO_PIN_RESET);
-		HAL_Delay(500U);
+    uint32_t now = HAL_GetTick();
+
+    if (app_poll_goto_boot())
+    {
+      app_reboot_into_boot();
+    }
+
+    /* LED 翻转走 tick 比较，主循环不再有 HAL_Delay 死等：
+       串口轮询间隙只有几微秒，命令不会丢字节 */
+    if ((now - s_last_toggle) >= 500U)
+    {
+      s_last_toggle = now;
+      HAL_GPIO_TogglePin(GPIOF, GPIO_PIN_9 | GPIO_PIN_10);
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
