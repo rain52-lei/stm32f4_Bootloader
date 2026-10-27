@@ -24,12 +24,15 @@
 
 #define FW_CHUNK_SIZE         256U
 #define FW_CHUNK_MAX_RETRIES  3U
+/* Keep the final committed packet available for a lost-ACK retry. */
+#define FW_FINAL_ACK_GRACE_MS  4000U
 
 int boot_slot_is_valid(uint32_t slot);
 uint32_t boot_slot_base(uint32_t slot);
 uint32_t boot_slot_end(uint32_t slot);
 int boot_flash_erase_slot(uint32_t slot, uint32_t app_size);
-int boot_flash_write_chunk(uint32_t address, const uint8_t *data, uint32_t length);
+int boot_flash_write_chunk(uint32_t slot, uint32_t address,
+                           const uint8_t *data, uint32_t length);
 int boot_receive_chunk(uint8_t *buffer, uint32_t length);
 int boot_receive_and_write(uint32_t slot, uint32_t total_size);
 

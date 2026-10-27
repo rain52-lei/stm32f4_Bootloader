@@ -20,7 +20,8 @@ import socket
 import time
 
 from flash_send import (DEFAULT_BIN_A, DEFAULT_BIN_B, parse_slot, send_firmware,
-                        slot_name, wait_for_any)
+                        slot_name, wait_for_any, wait_for_boot_banner,
+                        validate_firmware)
 
 LISTEN_PORT = 9000
 GOTOBOOT_CMD = b'GOTOBOOT'
@@ -48,8 +49,8 @@ class TcpLink:
         self._buf = bytearray()
 
     def read(self, size=1):
-        deadline = time.time() + 0.2
-        while len(self._buf) < size and time.time() < deadline:
+        deadline = time.monotonic() + 0.2
+        while len(self._buf) < size and time.monotonic() < deadline:
             try:
                 data = self._conn.recv(4096)
             except socket.timeout:
@@ -63,14 +64,15 @@ class TcpLink:
 
     def write(self, data):
         self._conn.sendall(data)
+        return len(data)
 
 
 def wait_download_slot(link, timeout=15.0):
     """从字符流里扫 DOWNLOAD=A/B。不用 flash_send.wait_for_boot_banner：
     它按整行解析，而轮询 GOTOBOOT 阶段可能已把横幅行吃掉一半。"""
     buf = b''
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         buf += link.read(1)
         buf = buf[-128:]
         match = re.search(rb'DOWNLOAD=([AB])', buf)
@@ -94,6 +96,7 @@ def main():
     path = args.path or (DEFAULT_BIN_A if args.slot == 0 else DEFAULT_BIN_B)
     with open(path, 'rb') as file:
         fw = file.read()
+    validate_firmware(fw, args.version, args.slot)
 
     print('固件   :', path)
     print('槽位   : %s    大小: %d 字节    版本: %d' %
@@ -113,19 +116,19 @@ def main():
     try:
         # 轮询 GOTOBOOT：App 在跑就重启进 boot；boot 在等窗口则被忽略。
         # 覆盖"App 早已运行/横幅已错过"等各种时序，最坏等到 boot 跳 App 后生效
-        deadline = time.time() + 40.0
-        while time.time() < deadline:
+        deadline = time.monotonic() + 40.0
+        download_slot = None
+        while time.monotonic() < deadline:
             link.write(GOTOBOOT_CMD)
-            if wait_for_any(link, ['GOTOBOOT FLAG', 'WAIT UPDATE'], 3.0):
+            # Consume and parse the complete banner in one reader. A preceding
+            # marker-only read could swallow WAIT UPDATE and lose DOWNLOAD.
+            download_slot = wait_for_boot_banner(link, timeout=3.0)
+            if download_slot is not None:
                 break
         else:
             print('!! 40 秒内没等到 bootloader 横幅：检查模块透传方向/波特率')
             return
 
-        download_slot = wait_download_slot(link)
-        if download_slot is None:
-            print('!! 没解析到 DOWNLOAD 槽位')
-            return
         if download_slot != args.slot:
             print('!! 下位机要求槽 %s，所选镜像是槽 %s；已停止发送' %
                   (slot_name(download_slot), slot_name(args.slot)))

@@ -2,6 +2,7 @@
 #include "boot_update.h"      /* boot_crc32_buffer / APP_MAX_SIZE */
 #include "stm32f4xx_hal.h"
 #include <stddef.h>
+#include <string.h>
 
 /* ---------- 双副本调度：read() 裁决后生效，写点函数据此选目标 ---------- */
 
@@ -27,6 +28,13 @@ static uint32_t metadata_copy_sector(uint32_t copy)
         return METADATA_0_SECTOR;
     }
     return METADATA_1_SECTOR;
+}
+
+/* Serial-number comparison, including UINT32_MAX -> 0 wraparound. */
+static int generation_is_newer(uint32_t candidate, uint32_t reference)
+{
+    uint32_t delta = candidate - reference;
+    return delta != 0U && delta < 0x80000000UL;
 }
 
 /* ---------- 位梯子：active_slot 编解码共用的底层 ---------- */
@@ -110,17 +118,19 @@ int boot_metadata_read(app_metadata_t *metadata)
     /* 两份都无效（全新板子 / 双双损坏）→ 没有档案，调用方构造默认记录 */
     if (!valid[0] && !valid[1])
     {
+        s_newest_copy = 0U;
+        s_stale_copy = 0U;
         return 0;
     }
 
     /* 裁决：先验货、后比号。generation 也在 CRC 覆盖区内——验不过的记录，
        它的流水号无从采信，所以 validity 永远在 generation 之前判。
-       回绕：uint32 每次升级 +1，绕回需 42.9 亿次升级，普通 > 比较即可 */
+       使用模32位流水号比较，支持最高代数回绕到0。 */
     if (valid[0] != valid[1])
     {
         s_newest_copy = (valid[0] != 0U) ? 0U : 1U;   /* 恰一份完好：它是唯一真值 */
     }
-    else if (copies[1].generation > copies[0].generation)
+    else if (generation_is_newer(copies[1].generation, copies[0].generation))
     {
         s_newest_copy = 1U;    /* 两份都完好：流水号大的是新一代 */
     }
@@ -183,20 +193,36 @@ int boot_metadata_begin_update(const app_metadata_t *old, uint32_t slot,
     FLASH_EraseInitTypeDef erase = {0};
     uint32_t sector_error;
     app_metadata_t next;
-    const uint32_t *words;
+    app_metadata_t current;
+    app_metadata_t verify;
     uint32_t i;
     uint32_t word_count;
     uint32_t stale_base;
 
     if (old == NULL || slot > SLOT_B ||
-        size == 0U || size > APP_MAX_SIZE || version == 0U)
+        size == 0U || size > APP_MAX_SIZE || version == 0U ||
+        ladder_step(old->active_slot) == METADATA_ILLEGAL_STEP)
     {
         return 0;
     }
 
     /* 以旧记录为底稿：另一槽的身份与状态、active 全部原样保留。
        active 不在这里重规整——决策权在 main，old->active_slot 由调用方给定 */
-    next = *old;
+    /* Refresh the copy scheduler for every session, including retries without
+       reset. Refuse a stale caller rather than erasing the current truth. */
+    if (boot_metadata_read(&current))
+    {
+        if (old->generation != current.generation)
+        {
+            return 0;
+        }
+        next = current;
+    }
+    else
+    {
+        boot_metadata_default(&next);
+    }
+    next.active_slot = old->active_slot;
     next.magic          = METADATA_MAGIC;
     next.format_version = METADATA_FORMAT_VERSION;
     next.slot[slot].size    = size;
@@ -206,7 +232,7 @@ int boot_metadata_begin_update(const app_metadata_t *old, uint32_t slot,
 
     /* 流水号 +1：这份新记录是第 old->generation + 1 代。
        必须在算 CRC 之前——generation 在 CRC 覆盖区内，先加后算，账才对得上 */
-    next.generation = old->generation + 1U;
+    next.generation += 1U;
 
     /* 必须在擦除前算好 CRC：擦完再算就来不及了（next 的原料抄自 Flash 里的 old），
        且 CRC 不含 state/active，之后两次原地编程都不影响它 */
@@ -233,19 +259,29 @@ int boot_metadata_begin_update(const app_metadata_t *old, uint32_t slot,
 
     /* 52 字节 = 13 个字，循环编程到 stale 副本。v1 逐字段写了 5 遍 HAL_FLASH_Program，
        字段翻倍后那种写法就不可维护了 */
-    words      = (const uint32_t *)&next;
     word_count = (uint32_t)(sizeof(app_metadata_t) / sizeof(uint32_t));
     for (i = 0U; i < word_count; i++)
     {
+        uint32_t word;
+        memcpy(&word, (const uint8_t *)&next + i * sizeof(word), sizeof(word));
         if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,
-                              stale_base + i * 4U, words[i]) != HAL_OK)
+                              stale_base + i * 4U, word) != HAL_OK)
         {
             HAL_FLASH_Lock();
             return 0;
         }
     }
 
-    HAL_FLASH_Lock();
+    if (HAL_FLASH_Lock() != HAL_OK)
+    {
+        return 0;
+    }
+    verify = *(const app_metadata_t *)stale_base;
+    if (!boot_metadata_is_valid(&verify) ||
+        memcmp(&verify, &next, sizeof(next)) != 0)
+    {
+        return 0;
+    }
 
     /* 新记录已完整落盘：即刻成为 newest——本会话内后续的 mark_valid /
        switch_active 都要写它；原来的 newest 降为 stale，等下一轮被重写。
@@ -289,8 +325,8 @@ int boot_metadata_mark_valid(uint32_t slot)
         HAL_FLASH_Lock();
         return 0;
     }
-    HAL_FLASH_Lock();
-    return 1;
+    return (HAL_FLASH_Lock() == HAL_OK &&
+            *state_word == SLOT_STATE_VALID) ? 1 : 0;
 }
 
 int boot_metadata_switch_active(void)
@@ -323,6 +359,5 @@ int boot_metadata_switch_active(void)
         HAL_FLASH_Lock();
         return 0;
     }
-    HAL_FLASH_Lock();
-    return 1;
+    return (HAL_FLASH_Lock() == HAL_OK && *field == next) ? 1 : 0;
 }

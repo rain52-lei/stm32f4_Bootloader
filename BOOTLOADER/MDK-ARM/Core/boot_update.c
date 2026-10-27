@@ -1,7 +1,7 @@
 #include "boot_update.h"
 #include "boot_flash.h"
 
-/* 串口接收 16 字节 → 成功返回 1，失败返回 0 */
+/* Receive the complete 20-byte firmware descriptor. */
 int boot_receive_header(firmware_header_t *header)
 {
 	if(header == NULL)
@@ -20,19 +20,32 @@ int boot_receive_header(firmware_header_t *header)
     每一包都接收12字节分包头 */
 int boot_receive_chunk_header(firmware_chunk_header_t *header)
 {
+    return boot_receive_chunk_header_timeout(header, SYNC_SCAN_TIMEOUT_MS);
+}
+
+int boot_receive_chunk_header_timeout(firmware_chunk_header_t *header,
+                                      uint32_t timeout_ms)
+{
 	uint8_t byte;
 	uint32_t sync_stage = 0U;
 	uint32_t start_tick = HAL_GetTick();
 	uint8_t locked = 0U;
 	
-	if(header == NULL)
+	if(header == NULL || timeout_ms == 0U)
 	{
 		return 0;
 	}
 	
-	while((HAL_GetTick() - start_tick) < SYNC_SCAN_TIMEOUT_MS)
+	while(1)
 	{
-		if(HAL_UART_Receive(&huart1, &byte, 1U, 10U) != HAL_OK)
+        uint32_t elapsed_scan = HAL_GetTick() - start_tick;
+        if (elapsed_scan >= timeout_ms)
+        {
+            break;
+        }
+        uint32_t remaining = timeout_ms - elapsed_scan;
+        uint32_t byte_wait = (remaining < 10U) ? remaining : 10U;
+		if(HAL_UART_Receive(&huart1, &byte, 1U, byte_wait) != HAL_OK)
 		{
 			continue;
 		}
@@ -58,7 +71,17 @@ int boot_receive_chunk_header(firmware_chunk_header_t *header)
 	}
 	
 	
-	if(HAL_UART_Receive(&huart1,(uint8_t *)header,sizeof(*header),1000U) == HAL_OK)
+    uint32_t elapsed = HAL_GetTick() - start_tick;
+    if (elapsed >= timeout_ms)
+    {
+        return 0;
+    }
+    uint32_t header_wait = timeout_ms - elapsed;
+    if (header_wait > 1000U)
+    {
+        header_wait = 1000U;
+    }
+	if(HAL_UART_Receive(&huart1,(uint8_t *)header,sizeof(*header),header_wait) == HAL_OK)
 	{
 		return 1;
 	}
@@ -88,10 +111,10 @@ int boot_header_is_valid(const firmware_header_t *header)
         return 0;
     }
     if (header->magic == FW_MAGIC &&
-        header->size != 0U &&
+        header->size >= 8U &&
         header->size <= APP_MAX_SIZE &&
-        header->version != 0U )
-        //header->image_slot == download_slot)
+        header->version != 0U &&
+        boot_slot_is_valid(header->image_slot))
     {
         return 1;
     }
@@ -150,7 +173,7 @@ int boot_send_chunk_reply(uint8_t status, uint32_t sequence)
 		reply[i] = (uint8_t)(sequence >> ((i - 1U) * 8U));
 	}
 	
-	if(HAL_UART_Transmit(&huart1, reply, sizeof(reply),HAL_MAX_DELAY) != HAL_OK)
+	if(HAL_UART_Transmit(&huart1, reply, sizeof(reply),BOOT_REPLY_TIMEOUT_MS) != HAL_OK)
 	{
 		return 0;
 	}

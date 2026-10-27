@@ -60,6 +60,8 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static int slot_is_bootable(const app_metadata_t *metadata, uint32_t slot);
+
 static int metadata_slot_is_valid(const app_metadata_t *metadata, uint32_t slot)
 {
   return metadata != NULL &&
@@ -72,11 +74,11 @@ static uint32_t select_active_slot(const app_metadata_t *metadata)
   uint32_t active = boot_metadata_active_index(metadata->active_slot);
   uint32_t other = (active == SLOT_A) ? SLOT_B : SLOT_A;
 
-  if (metadata_slot_is_valid(metadata, active))
+  if (slot_is_bootable(metadata, active))
   {
     return active;
   }
-  if (metadata_slot_is_valid(metadata, other))
+  if (slot_is_bootable(metadata, other))
   {
     return other;
   }
@@ -106,7 +108,8 @@ static int slot_is_bootable(const app_metadata_t *metadata, uint32_t slot)
 
   base = boot_slot_base(slot);
   end = boot_slot_end(slot);
-  if (!boot_app_is_valid(base, end))
+  if (metadata->slot[slot].size > (end - base) ||
+      !boot_app_is_valid(base, base + metadata->slot[slot].size))
   {
     return 0;
   }
@@ -205,13 +208,6 @@ int main(void)
   uint32_t download_slot;
   uint32_t goto_boot;
 
-  if (!boot_metadata_read(&metadata) || !boot_metadata_is_valid(&metadata))
-  {
-    boot_metadata_default(&metadata);
-  }
-  active_slot = select_active_slot(&metadata);
-  download_slot = select_download_slot(&metadata, active_slot);
-
   /* App 留过言就开长窗口：给上位机足够时间发起升级；普通上电仍是 2 秒 */
   goto_boot = boot_goto_boot_requested();
   if (goto_boot != 0U)
@@ -220,26 +216,34 @@ int main(void)
                       sizeof(goto_boot_notice) - 1U, HAL_MAX_DELAY);
   }
 
-  /* 横幅存进指针供失败循环复播：上位机见到 WAIT UPDATE 即可再次发起升级，
-     不必按复位重新掐 2 秒窗口 */
-  if (active_slot == SLOT_B)
-  {
-    wait_msg = wait_ba;
-    wait_len = sizeof(wait_ba) - 1U;
-  }
-  else if (download_slot == SLOT_B)
-  {
-    wait_msg = wait_ab;
-    wait_len = sizeof(wait_ab) - 1U;
-  }
-  HAL_UART_Transmit(&huart1, wait_msg, wait_len, HAL_MAX_DELAY);
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* Re-read Flash before every new command window. A failed session may
+       already have written generation+1 and changed newest/stale roles. */
+    if (!boot_metadata_read(&metadata))
+    {
+      boot_metadata_default(&metadata);
+    }
+    active_slot = select_active_slot(&metadata);
+    download_slot = select_download_slot(&metadata, active_slot);
+    wait_msg = wait_a;
+    wait_len = sizeof(wait_a) - 1U;
+    if (active_slot == SLOT_B)
+    {
+      wait_msg = wait_ba;
+      wait_len = sizeof(wait_ba) - 1U;
+    }
+    else if (download_slot == SLOT_B)
+    {
+      wait_msg = wait_ab;
+      wait_len = sizeof(wait_ab) - 1U;
+    }
+    HAL_UART_Transmit(&huart1, wait_msg, wait_len, 1000U);
+
     /* 长窗口只在进门第一轮生效；失败后的重试轮次仍是 2 秒 */
     uint32_t window_ms = (goto_boot != 0U) ?
                          BOOT_GOTOBOOT_WINDOW_MS : BOOT_UPDATE_WINDOW_MS;
@@ -309,6 +313,12 @@ int main(void)
             status = crc_fail;
             status_length = sizeof(crc_fail) - 1U;
           }
+          else if (!boot_app_is_valid(boot_slot_base(download_slot),
+                                      boot_slot_base(download_slot) + header.size))
+          {
+            status = invalid;
+            status_length = sizeof(invalid) - 1U;
+          }
           else if (!boot_metadata_mark_valid(download_slot))
           {
             status = metadata_fail;
@@ -372,7 +382,6 @@ int main(void)
     {
       HAL_GPIO_TogglePin(GPIOF, GPIO_PIN_9 | GPIO_PIN_10);
       HAL_UART_Transmit(&huart1, status, status_length, HAL_MAX_DELAY);
-      HAL_UART_Transmit(&huart1, wait_msg, wait_len, HAL_MAX_DELAY);
     }
     /* USER CODE END WHILE */
 
