@@ -33,6 +33,7 @@ keil-assistant.log
 # ===== Python =====
 __pycache__/
 *.pyc
+.build/
 
 # ===== 系统/编辑器 =====
 Thumbs.db
@@ -59,6 +60,11 @@ BootLoader功能与架构分析.md
 函数笔记.md
 简历项目经历-定稿.md
 README.md
+!tests/README.md
+.obsidian-export/
+代码完善记录-2026-10-27.md
+嵌入式项目执行书.md
+嵌入式项目选题报告书.md
 
 # ===== Keil 生成的临时目录 =====
 BOOTLOADER/MDK-ARM/RTE/_test/

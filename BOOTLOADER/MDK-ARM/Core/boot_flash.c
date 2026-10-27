@@ -79,13 +79,23 @@ int boot_flash_erase_slot(uint32_t slot, uint32_t app_size)
     return 1;
 }
 
-int boot_flash_write_chunk(uint32_t address, const uint8_t *data, uint32_t length)
+int boot_flash_write_chunk(uint32_t slot, uint32_t address,
+                           const uint8_t *data, uint32_t length)
 {
     uint32_t word;
+    uint32_t base = boot_slot_base(slot);
+    uint32_t end = boot_slot_end(slot);
 
-    if (data == NULL || length == 0U || address < SLOT_A_BASE ||
-        address >= APP_FLASH_END || length > (APP_FLASH_END - address) ||
+    if (base == 0U || data == NULL || length == 0U || address < base ||
+        address >= end || length > (end - address) ||
         (address % 4U) != 0U)
+    {
+        return 0;
+    }
+
+    /* The last partial word is still a four-byte Flash operation. */
+    if ((length % 4U) != 0U &&
+        (4U - (length % 4U)) > (end - address - length))
     {
         return 0;
     }
@@ -103,6 +113,11 @@ int boot_flash_write_chunk(uint32_t address, const uint8_t *data, uint32_t lengt
                ((uint32_t)data[3] << 24U);
 
         if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, address, word) != HAL_OK)
+        {
+            HAL_FLASH_Lock();
+            return 0;
+        }
+        if (*(volatile const uint32_t *)address != word)
         {
             HAL_FLASH_Lock();
             return 0;
@@ -126,6 +141,11 @@ int boot_flash_write_chunk(uint32_t address, const uint8_t *data, uint32_t lengt
                 HAL_FLASH_Lock();
                 return 0;
             }
+            if (*(volatile const uint32_t *)address != word)
+            {
+                HAL_FLASH_Lock();
+                return 0;
+            }
         }
     }
 
@@ -142,12 +162,57 @@ int boot_receive_chunk(uint8_t *target, uint32_t length)
     return (HAL_UART_Receive(&huart1, target, length, 3000U) == HAL_OK) ? 1 : 0;
 }
 
+static int chunk_matches(const firmware_chunk_header_t *header,
+                          const firmware_chunk_header_t *committed)
+{
+    return header->sequence == committed->sequence &&
+           header->length == committed->length &&
+           header->crc32 == committed->crc32;
+}
+
+/* Do not commit metadata/reset immediately after the final ACK. The host
+   must have a bounded chance to repeat a header if that ACK was lost. */
+static int finish_chunk_replies(const firmware_chunk_header_t *committed)
+{
+    uint32_t start = HAL_GetTick();
+    uint32_t replies = 0U;
+
+    while ((HAL_GetTick() - start) < FW_FINAL_ACK_GRACE_MS)
+    {
+        firmware_chunk_header_t header;
+        uint32_t elapsed = HAL_GetTick() - start;
+        if (elapsed >= FW_FINAL_ACK_GRACE_MS)
+        {
+            break;
+        }
+        if (!boot_receive_chunk_header_timeout(&header,
+                FW_FINAL_ACK_GRACE_MS - elapsed))
+        {
+            break;
+        }
+        if (chunk_matches(&header, committed))
+        {
+            if (!boot_send_chunk_reply(BOOT_REPLY_ACK, committed->sequence))
+            {
+                return 0;
+            }
+            if (++replies >= FW_CHUNK_MAX_RETRIES)
+            {
+                break;
+            }
+        }
+    }
+    return 1;
+}
+
 int boot_receive_and_write(uint32_t slot, uint32_t total_size)
 {
     uint32_t received = 0U;
     uint32_t expected_sequence = 0U;
     uint32_t base = boot_slot_base(slot);
     uint32_t end = boot_slot_end(slot);
+    firmware_chunk_header_t committed = {0};
+    uint32_t replay_count = 0U;
 
     if (base == 0U || total_size == 0U || total_size > APP_MAX_SIZE ||
         total_size > (end - base))
@@ -169,7 +234,23 @@ int boot_receive_and_write(uint32_t slot, uint32_t total_size)
             if (!boot_receive_chunk_header(&chunk_header))
             {
                 retry_count++;
-                boot_send_chunk_reply(BOOT_REPLY_NACK, expected_sequence);
+                if (!boot_send_chunk_reply(BOOT_REPLY_NACK, expected_sequence))
+                {
+                    return 0;
+                }
+                continue;
+            }
+
+            /* A repeated header for the last committed packet needs only ACK.
+               Never receive its data again and never program Flash twice. */
+            if (expected_sequence != 0U &&
+                chunk_matches(&chunk_header, &committed))
+            {
+                if (++replay_count > FW_CHUNK_MAX_RETRIES ||
+                    !boot_send_chunk_reply(BOOT_REPLY_ACK, committed.sequence))
+                {
+                    return 0;
+                }
                 continue;
             }
 
@@ -177,7 +258,10 @@ int boot_receive_and_write(uint32_t slot, uint32_t total_size)
                 chunk_header.length != chunk_size)
             {
                 retry_count++;
-                boot_send_chunk_reply(BOOT_REPLY_NACK, expected_sequence);
+                if (!boot_send_chunk_reply(BOOT_REPLY_NACK, expected_sequence))
+                {
+                    return 0;
+                }
                 continue;
             }
 
@@ -189,22 +273,30 @@ int boot_receive_and_write(uint32_t slot, uint32_t total_size)
             if (!boot_receive_chunk(buffer, chunk_header.length))
             {
                 retry_count++;
-                boot_send_chunk_reply(BOOT_REPLY_NACK, expected_sequence);
+                if (!boot_send_chunk_reply(BOOT_REPLY_NACK, expected_sequence))
+                {
+                    return 0;
+                }
                 continue;
             }
 
             if (boot_crc32_buffer(buffer, chunk_header.length) != chunk_header.crc32)
             {
                 retry_count++;
-                boot_send_chunk_reply(BOOT_REPLY_NACK, expected_sequence);
+                if (!boot_send_chunk_reply(BOOT_REPLY_NACK, expected_sequence))
+                {
+                    return 0;
+                }
                 continue;
             }
 
-            if (!boot_flash_write_chunk(base + received, buffer, chunk_header.length))
+            if (!boot_flash_write_chunk(slot, base + received, buffer,
+                                          chunk_header.length))
             {
-                retry_count++;
+                /* A Flash failure may have partially programmed a word.
+                   Restart the session with erase instead of rewriting it. */
                 boot_send_chunk_reply(BOOT_REPLY_NACK, expected_sequence);
-                continue;
+                return 0;
             }
 
             if (!boot_send_chunk_reply(BOOT_REPLY_ACK, expected_sequence))
@@ -213,7 +305,9 @@ int boot_receive_and_write(uint32_t slot, uint32_t total_size)
             }
 
             received += chunk_header.length;
+            committed = chunk_header;
             expected_sequence++;
+            replay_count = 0U;
             chunk_success = 1U;
             break;
         }
@@ -224,5 +318,5 @@ int boot_receive_and_write(uint32_t slot, uint32_t total_size)
         }
     }
 
-    return 1;
+    return finish_chunk_replies(&committed);
 }

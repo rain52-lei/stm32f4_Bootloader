@@ -4,14 +4,29 @@
 
 #define APP_SRAM_END  0x20020000UL
 
-typedef void (*app_entry_t)(void);
+/* No C code may use the old stack after changing MSP. r0/r1 are the AAPCS
+   arguments; branch directly instead of making another C function call. */
+__attribute__((naked, noreturn)) static void boot_start_app(uint32_t msp,
+                                                          uint32_t reset)
+{
+    __asm volatile (
+        "movs r2, #0\n"
+        "msr control, r2\n"
+        "isb\n"
+        "msr msp, r0\n"
+        "dsb\n"
+        "isb\n"
+        "cpsie i\n"
+        "bx r1\n"
+    );
+}
 
 int boot_app_is_valid(uint32_t app_base, uint32_t app_end)
 {
     uint32_t app_msp;
     uint32_t app_reset;
 
-    if (app_base == 0U || app_base >= app_end)
+    if (app_base == 0U || app_base >= app_end || (app_end - app_base) < 8U)
     {
         return 0;
     }
@@ -19,7 +34,7 @@ int boot_app_is_valid(uint32_t app_base, uint32_t app_end)
     app_msp = *(volatile const uint32_t *)app_base;
     app_reset = *(volatile const uint32_t *)(app_base + 4U);
 
-    if (app_msp < SRAM1_BASE || app_msp > APP_SRAM_END || (app_msp & 0x7U) != 0U)
+    if (app_msp <= SRAM1_BASE || app_msp > APP_SRAM_END || (app_msp & 0x7U) != 0U)
     {
         return 0;
     }
@@ -56,6 +71,7 @@ void boot_jump_to_app(uint32_t app_base, uint32_t app_end)
     SysTick->CTRL = 0U;
     SysTick->LOAD = 0U;
     SysTick->VAL = 0U;
+    SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk | SCB_ICSR_PENDSVCLR_Msk;
 
     for (uint32_t i = 0U; i < 8U; i++)
     {
@@ -70,23 +86,19 @@ void boot_jump_to_app(uint32_t app_base, uint32_t app_end)
     /* __disable_irq 置位的 PRIMASK 必须在这里清掉：App 的 startup 不会重开
        全局中断，少这行 App 里第一个 HAL_Delay 就等不到 SysTick、永久卡死。
        此处 NVIC 使能与挂起均已清空，重开不会冒出意外中断 */
-    __enable_irq();
-
-    __set_CONTROL(0U);
-    __set_MSP(app_msp);
-    __DSB();
-    __ISB();
-
-    ((app_entry_t)app_reset)();
+    __set_BASEPRI(0U);
+    __set_FAULTMASK(0U);
+    boot_start_app(app_msp, app_reset);
 
     while (1)
     {
     }
 }
 
-/* App 想升级时往 RTC 备份寄存器 BKP0R 写 GOTOBOOT_MAGIC 再复位。
-   备份域 VBAT 供电：系统复位不清零、掉电才清零——所以只有 App 主动留言
-   才命中，普通上电开机不会误入升级模式。读到标志立即清掉，
+/* App writes a one-shot request to BKP0R before software reset. Backup data
+   can survive VDD removal when VBAT remains powered. Consume the request
+   immediately; do not assume that every power cycle clears the backup domain.
+   读到标志立即清掉，
    写备份域要先解 DBP 写保护（PWR 时钟 SystemClock_Config 已开）。 */
 #define GOTOBOOT_MAGIC  0x4F544144UL    /* ASCII "OTAD"，与 App 侧约定一致 */
 

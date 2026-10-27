@@ -52,23 +52,18 @@ def main():
             print('>>> 未捕获 APP READY（可能早已在运行），盲发 GOTOBOOT...')
 
         ser.write(GOTOBOOT_CMD)
-        marker = wait_for_any(ser, ['GOTOBOOT FLAG', 'WAIT UPDATE'], timeout=15.0)
-        if marker is None:
-            print('!! 没等到 bootloader 横幅：确认两侧固件都已更新到 GOTOBOOT 版本')
-            return
-        print('Bootloader 横幅已出现（%s），开始升级' % marker)
-
         download_slot = wait_for_boot_banner(ser, timeout=15.0)
         if download_slot is None:
-            print('!! 没解析到 DOWNLOAD 槽位')
+            print('!! 没等到 bootloader 横幅：确认两侧固件都已更新到 GOTOBOOT 版本')
             return
+        print('Bootloader 横幅已出现，开始升级')
         if download_slot != args.slot:
             print('!! 下位机要求槽 %s，所选镜像是槽 %s；已停止发送' %
                   (slot_name(download_slot), slot_name(args.slot)))
             return
 
-        send_firmware(ser, fw, args.version, args.slot)
-        print('=== GOTOBOOT 触发升级测试完成：全程未按复位键 ===')
+        if send_firmware(ser, fw, args.version, args.slot):
+            print('=== GOTOBOOT 触发升级测试完成：全程未按复位键 ===')
     finally:
         ser.close()
 

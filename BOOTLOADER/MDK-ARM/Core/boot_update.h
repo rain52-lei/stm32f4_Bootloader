@@ -16,6 +16,7 @@
 #define CHUNK_SYNC0           0xAAU
 #define CHUNK_SYNC1           0x55U
 #define SYNC_SCAN_TIMEOUT_MS  5000U
+#define BOOT_REPLY_TIMEOUT_MS 1000U
 
 /* 20-byte little-endian firmware descriptor shared with the host. */
 typedef struct
@@ -39,6 +40,8 @@ typedef char chunk_header_size_check[(sizeof(firmware_chunk_header_t) == 12U) ? 
 
 int boot_receive_header(firmware_header_t *header);
 int boot_receive_chunk_header(firmware_chunk_header_t *header);
+int boot_receive_chunk_header_timeout(firmware_chunk_header_t *header,
+                                      uint32_t timeout_ms);
 int boot_header_is_valid(const firmware_header_t *header);
 int boot_chunk_header_is_valid(const firmware_chunk_header_t *header,
                                uint32_t expected_sequence);

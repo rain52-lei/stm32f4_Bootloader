@@ -48,9 +48,9 @@ def main():
     print(">>> 已发送 UPDATE + 20 字节固件头；故意不发送固件数据。")
 
     if not wait_for(ser, "ERASE OK", timeout=20):
-        print("!! 20 秒内没等到 ERASE OK。请在 Keil Memory 查看 0x08010000：")
-        print("   若第 4 个字为 7FFFFFFF，说明 UPDATING 已写入，按复位即可测试保护。")
-        print("   若全是 FF，则需要检查新 Bootloader 是否已 Rebuild + Download。")
+        print("!! 20 秒内没等到 ERASE OK。请检查两个 Metadata 副本：")
+        print("   副本0=0x0800C000，副本1=0x08010000。v3 的状态字偏移为36/40字节。")
+        print("   先校验记录与 generation，不能只按固定地址或旧字段偏移判断。")
         ser.close()
         return
 

@@ -33,9 +33,14 @@ BOOT_REPLY_ACK = 0x06
 BOOT_REPLY_NACK = 0x15
 BOOT_REPLY_READY = 0x16
 CHUNK_SYNC = b'\xAA\x55'
+APP_MAX_SIZE = 0x60000
+PACKET_REPLY_TIMEOUT = 1.5  # Shorter than the MCU final-ACK grace (4 seconds).
+UINT32_MAX = 0xFFFFFFFF
 
 
 def slot_name(slot):
+    if slot not in (SLOT_A, SLOT_B):
+        raise ValueError('槽号必须是 A(0) 或 B(1)')
     return 'A' if slot == SLOT_A else 'B'
 
 
@@ -57,8 +62,8 @@ def wait_for_any(ser, markers, timeout=5.0):
     """等待任意一条 Bootloader 文本提示，返回命中的文本或 None。"""
     buf = b''
     encoded = [(marker, marker.encode()) for marker in markers]
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
             data = ser.read(1)
         except serial.SerialException as exc:
@@ -78,8 +83,8 @@ def wait_for_any(ser, markers, timeout=5.0):
 def wait_for_boot_banner(ser, timeout=15.0):
     """读取启动 banner，返回下位机声明的 DOWNLOAD 槽；无法解析返回 None。"""
     buf = b''
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
             data = ser.read(1)
         except serial.SerialException as exc:
@@ -107,8 +112,8 @@ def wait_for_boot_banner(ser, timeout=15.0):
 def read_exact(ser, length, timeout=5.0):
     """在总超时内读满指定长度，避免短读导致二进制回复失步。"""
     data = bytearray()
-    deadline = time.time() + timeout
-    while len(data) < length and time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while len(data) < length and time.monotonic() < deadline:
         try:
             part = ser.read(length - len(data))
         except serial.SerialException as exc:
@@ -122,15 +127,15 @@ def read_exact(ser, length, timeout=5.0):
 def read_chunk_reply_value(ser, timeout=5.0):
     """读取一条 5 字节二进制回复，返回 (status, sequence) 或 None。"""
     reply_statuses = (BOOT_REPLY_ACK, BOOT_REPLY_NACK, BOOT_REPLY_READY)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        raw_status = read_exact(ser, 1, max(0.01, deadline - time.time()))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        raw_status = read_exact(ser, 1, max(0.01, deadline - time.monotonic()))
         if raw_status is None:
             return None
         status = raw_status[0]
         if status not in reply_statuses:
             continue
-        payload = read_exact(ser, 4, max(0.01, deadline - time.time()))
+        payload = read_exact(ser, 4, max(0.01, deadline - time.monotonic()))
         if payload is None:
             return None
         return status, struct.unpack('<I', payload)[0]
@@ -154,19 +159,56 @@ def send_chunk_header(ser, sequence, length, crc32_val):
 
 
 def send_packet(ser, sequence, chunk, max_retries=MAX_RETRIES):
-    """发送一包并执行 READY/ACK 重试，成功返回 True。"""
+    """READY 后发数据；重复已写包的头若直接收到 ACK，不再发数据。"""
+    if not chunk or len(chunk) > CHUNK or max_retries <= 0:
+        return False
     chunk_crc = zlib.crc32(chunk) & 0xFFFFFFFF
     for attempt in range(1, max_retries + 1):
         send_chunk_header(ser, sequence, len(chunk), chunk_crc)
-        if not read_chunk_reply(ser, BOOT_REPLY_READY, sequence):
+        reply = wait_packet_reply(ser, sequence,
+                                  (BOOT_REPLY_READY, BOOT_REPLY_ACK))
+        if reply == BOOT_REPLY_ACK:
+            return True  # Previous data was committed; only its ACK was lost.
+        if reply != BOOT_REPLY_READY:
             print('\n!! 第 %d 包未收到 READY（第 %d/%d 次）' %
                   (sequence, attempt, max_retries))
             continue
         ser.write(chunk)
-        if read_chunk_reply(ser, BOOT_REPLY_ACK, sequence):
+        if wait_packet_reply(ser, sequence, (BOOT_REPLY_ACK,)) == BOOT_REPLY_ACK:
             return True
         print('\n!! 第 %d 包未收到 ACK，将重试' % sequence)
     return False
+
+
+def wait_packet_reply(ser, sequence, accepted, timeout=PACKET_REPLY_TIMEOUT):
+    """Ignore old-sequence replies; distinguish NACK from timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        reply = read_chunk_reply_value(ser, deadline - time.monotonic())
+        if reply is None:
+            return None
+        status, reply_sequence = reply
+        if reply_sequence != sequence:
+            continue
+        if status == BOOT_REPLY_NACK or status in accepted:
+            return status
+    return None
+
+
+def validate_firmware(fw, version, image_slot):
+    """Reject bad ranges and mislabeled A/B binaries before sending UPDATE."""
+    if image_slot not in (SLOT_A, SLOT_B):
+        raise ValueError('镜像槽号必须为 A(0) 或 B(1)')
+    if not 0 < version <= UINT32_MAX:
+        raise ValueError('版本号必须在 1..4294967295 范围内')
+    if not 8 <= len(fw) <= APP_MAX_SIZE:
+        raise ValueError('固件必须包含向量表，且大小不超过 384 KB')
+    base = 0x08020000 if image_slot == SLOT_A else 0x080A0000
+    msp, reset = struct.unpack_from('<II', fw)
+    if not (0x20000000 < msp <= 0x20020000) or msp % 8:
+        raise ValueError('固件初始栈指针不合法')
+    if not reset & 1 or not base <= (reset & ~1) < base + len(fw):
+        raise ValueError('固件复位入口与所选槽不匹配，请重新选择 A/B 镜像')
 
 
 def open_serial(port=PORT):
@@ -174,12 +216,17 @@ def open_serial(port=PORT):
     ser.dtr = False
     ser.rts = False
     ser.port = port
-    ser.open()
-    ser.reset_input_buffer()
+    try:
+        ser.open()
+        ser.reset_input_buffer()
+    except Exception:
+        ser.close()
+        raise
     return ser
 
 
 def send_firmware(ser, fw, version, image_slot):
+    validate_firmware(fw, version, image_slot)
     size = len(fw)
     crc = zlib.crc32(fw) & 0xFFFFFFFF
 
@@ -224,12 +271,16 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
-    if args.version <= 0:
-        raise SystemExit('版本号必须大于 0')
+    if not 0 < args.version <= UINT32_MAX:
+        raise SystemExit('版本号必须在 1..4294967295 范围内')
 
     path = args.path or (DEFAULT_BIN_A if args.slot == SLOT_A else DEFAULT_BIN_B)
     with open(path, 'rb') as file:
         fw = file.read()
+    try:
+        validate_firmware(fw, args.version, args.slot)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
     print('固件   :', path)
     print('槽位   :', slot_name(args.slot))
@@ -243,15 +294,15 @@ def main():
         download_slot = wait_for_boot_banner(ser)
         if download_slot is None:
             print('!! 没等到带 DOWNLOAD 槽位的 Bootloader 提示')
-            return
+            return 1
         if download_slot != args.slot:
             print('!! 下位机当前要求槽 %s，但所选镜像是槽 %s；已停止发送' %
                   (slot_name(download_slot), slot_name(args.slot)))
-            return
-        send_firmware(ser, fw, args.version, args.slot)
+            return 1
+        return 0 if send_firmware(ser, fw, args.version, args.slot) else 1
     finally:
         ser.close()
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
